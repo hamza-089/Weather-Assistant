@@ -1,5 +1,7 @@
+
 import os
 import requests
+import streamlit as st
 from dotenv import load_dotenv
 
 from langchain_core.tools import tool
@@ -11,37 +13,60 @@ from langgraph.prebuilt import ToolNode, tools_condition
 
 
 # ============================================================
-# 1. LOAD ENVIRONMENT VARIABLES
+# 1. LOAD ENVIRONMENT VARIABLES AND STREAMLIT SECRETS
 # ============================================================
 
 load_dotenv()
 
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+
+def get_secret(key: str):
+    """
+    Read an API key from environment variables or Streamlit Secrets.
+
+    Environment variables take priority, allowing local .env
+    configuration and deployment environment variables.
+    """
+
+    value = os.getenv(key)
+
+    if value:
+        return value
+
+    try:
+        value = st.secrets.get(key)
+        return str(value) if value else None
+    except Exception:
+        # Streamlit Secrets may not be configured during local runs.
+        return None
+
+
+OPENWEATHER_API_KEY = get_secret("OPENWEATHER_API_KEY")
+GOOGLE_API_KEY = get_secret("GOOGLE_API_KEY")
+
 
 if not OPENWEATHER_API_KEY:
     raise ValueError(
-        "OPENWEATHER_API_KEY is not set in the .env file."
+        "OPENWEATHER_API_KEY is missing. "
+        "Add it to your local .env file or Streamlit Secrets."
     )
 
-if not os.getenv("GOOGLE_API_KEY"):
+if not GOOGLE_API_KEY:
     raise ValueError(
-        "GOOGLE_API_KEY is not set in the .env file."
+        "GOOGLE_API_KEY is missing. "
+        "Add it to your local .env file or Streamlit Secrets."
     )
+
+
+# Make the Google key available to the Gemini integration.
+os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
 
 
 # ============================================================
 # 2. LANGSMITH CONFIGURATION
 # ============================================================
 
-os.environ.setdefault(
-    "LANGSMITH_TRACING",
-    "true"
-)
-
-os.environ.setdefault(
-    "LANGSMITH_PROJECT",
-    "weather_assistant"
-)
+os.environ.setdefault("LANGSMITH_TRACING", "false")
+os.environ.setdefault("LANGSMITH_PROJECT", "weather_assistant")
 
 
 # ============================================================
@@ -51,13 +76,14 @@ os.environ.setdefault(
 @tool
 def get_weather(city: str) -> str:
     """
-    Get the current weather of a specific city.
+    Get the current weather for a specific city.
 
-    Use this tool only when the user asks about:
-    - weather
-    - temperature
-    - climate
-    - current weather conditions
+    Use this tool when the user asks about:
+    - Weather
+    - Temperature
+    - Current weather conditions
+    - Humidity
+    - How hot or cold a city is
     """
 
     url = "https://api.openweathermap.org/data/2.5/weather"
@@ -72,48 +98,77 @@ def get_weather(city: str) -> str:
         response = requests.get(
             url,
             params=params,
-            timeout=10,
+            timeout=15,
         )
 
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError:
+            return "The weather service returned an invalid response."
 
-    except requests.RequestException as e:
-        return f"Could not reach weather service: {e}"
+    except requests.RequestException:
+        return (
+            "I could not connect to the weather service. "
+            "Please try again later."
+        )
 
     if response.status_code != 200:
-        return (
-            f"Weather API error: "
-            f"{data.get('message', 'Unknown error')}"
-        )
+        message = data.get("message", "Unknown error")
+
+        if response.status_code == 401:
+            return (
+                "The weather service rejected the API key. "
+                "Please check your OpenWeather API configuration."
+            )
+
+        if response.status_code == 404:
+            return (
+                f"I could not find weather information for '{city}'. "
+                "Please check the city name and try again."
+            )
+
+        return f"Weather API error: {message}"
 
     try:
-        temp = data["main"]["temp"]
+        city_name = data.get("name", city)
+        country = data.get("sys", {}).get("country", "")
+
+        temperature = data["main"]["temp"]
         feels_like = data["main"]["feels_like"]
         humidity = data["main"]["humidity"]
         condition = data["weather"][0]["description"]
-    except (KeyError, IndexError):
-        return "Weather API returned an unexpected response."
+        wind_speed = data.get("wind", {}).get("speed")
+
+    except (KeyError, IndexError, TypeError):
+        return "The weather service returned an unexpected response."
 
     # Temperature analysis
-    if temp >= 30:
+    if temperature >= 30:
         analysis = "It is hot."
-    elif temp >= 15:
+    elif temperature >= 15:
         analysis = "The temperature is moderate."
     else:
         analysis = "It is cold."
 
-    return (
-        f"City: {city}\n"
-        f"Temperature: {temp}°C\n"
-        f"Feels like: {feels_like}°C\n"
-        f"Condition: {condition}\n"
-        f"Humidity: {humidity}%\n"
-        f"Analysis: {analysis}"
+    location = (
+        f"{city_name}, {country}"
+        if country
+        else city_name
     )
 
+    result = (
+        f"Current weather for {location}:\n"
+        f"Temperature: {temperature}°C\n"
+        f"Feels like: {feels_like}°C\n"
+        f"Condition: {condition.capitalize()}\n"
+        f"Humidity: {humidity}%\n"
+        f"Temperature analysis: {analysis}"
+    )
 
-# List of tools
-tools = [get_weather]
+    if wind_speed is not None:
+        result += f"\nWind speed: {wind_speed} m/s"
+
+    return result
 
 
 # ============================================================
@@ -121,11 +176,11 @@ tools = [get_weather]
 # ============================================================
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash",
+    model="gemini-2.5-flash",
     temperature=0,
 )
 
-llm_with_tools = llm.bind_tools(tools)
+llm_with_tools = llm.bind_tools([get_weather])
 
 
 # ============================================================
@@ -133,24 +188,24 @@ llm_with_tools = llm.bind_tools(tools)
 # ============================================================
 
 SYSTEM_PROMPT = """
-You are a helpful weather assistant.
+You are a helpful and friendly AI assistant with weather capabilities.
 
-If the user asks about:
+WEATHER QUESTIONS:
+- For current weather, temperature, humidity, or current conditions
+  in a specific city, you MUST use the get_weather tool.
+- Do not invent weather data.
+- After receiving the tool result, explain it clearly and naturally.
+- If the city cannot be found or the weather service reports an error,
+  explain the issue to the user.
 
-- weather
-- temperature
-- climate
-- current weather conditions
+NON-WEATHER QUESTIONS:
+- Answer general questions normally using your language model.
+- Do not call the weather tool for unrelated questions.
 
-for a specific city, you MUST use the get_weather tool.
-
-For questions that are not related to weather,
-answer normally using the language model.
-
-Do not use the weather tool for unrelated questions.
-
-After receiving the weather information from the tool,
-explain it clearly and naturally to the user.
+GENERAL BEHAVIOR:
+- Be clear, helpful, and concise.
+- Use the temperature and weather information returned by the tool.
+- Do not claim that you checked current weather unless you used the tool.
 """
 
 
@@ -160,22 +215,18 @@ explain it clearly and naturally to the user.
 
 def assistant(state: MessagesState):
     """
-    Main assistant node.
-
-    The model decides whether it needs to call
-    the weather tool.
+    Process conversation messages and decide whether to call a tool.
     """
 
     messages = [
-        SystemMessage(content=SYSTEM_PROMPT)
+        SystemMessage(content=SYSTEM_PROMPT),
+        *state["messages"],
     ]
-
-    messages.extend(state["messages"])
 
     response = llm_with_tools.invoke(messages)
 
     return {
-        "messages": [response]
+        "messages": [response],
     }
 
 
@@ -185,44 +236,22 @@ def assistant(state: MessagesState):
 
 builder = StateGraph(MessagesState)
 
-
-# Add assistant node
-builder.add_node(
-    "assistant",
-    assistant
-)
-
-
-# Add tool node
-builder.add_node(
-    "tools",
-    ToolNode(tools)
-)
+builder.add_node("assistant", assistant)
+builder.add_node("tools", ToolNode([get_weather]))
 
 
 # ============================================================
 # 8. GRAPH EDGES
 # ============================================================
 
-# START → Assistant
-builder.add_edge(
-    START,
-    "assistant"
-)
+builder.add_edge(START, "assistant")
 
-
-# Assistant → Tool OR END
 builder.add_conditional_edges(
     "assistant",
-    tools_condition
+    tools_condition,
 )
 
-
-# Tool → Assistant
-builder.add_edge(
-    "tools",
-    "assistant"
-)
+builder.add_edge("tools", "assistant")
 
 
 # ============================================================
@@ -236,10 +265,7 @@ graph = builder.compile()
 # 10. EXPOSE GRAPH TO LANGGRAPH SERVER
 # ============================================================
 
-# langgraph.json points to this variable:
-#
-# ./main.py:agent
-#
-# Therefore this variable MUST exist.
+# If langgraph.json points to ./main.py:agent,
+# this variable must exist.
 
 agent = graph
